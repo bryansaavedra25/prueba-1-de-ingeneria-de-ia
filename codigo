@@ -1,0 +1,223 @@
+
+from typing import List, Optional, Dict, Any
+from pydantic import BaseModel
+from fastapi import FastAPI, HTTPException
+import os
+import logging
+import uuid
+import json
+
+# Imports de LangChain
+from langchain_community.document_loaders import TextLoader
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_community.embeddings import HuggingFaceEmbeddings
+from langchain_community.vectorstores import FAISS
+from langchain.llms import OpenAI
+from langchain.chains import RetrievalQA
+from langchain.prompts import PromptTemplate
+
+# ---------------- CONFIGURACIÓN ----------------
+CARPETA_DOCUMENTOS = "./docs"                       # Carpeta con manuales, políticas, guías
+RUTA_VECTORSTORE = "./vectorstore/faiss_index"      # Lugar donde se guarda el índice FAISS
+MODELO_EMBEDDING = "sentence-transformers/all-MiniLM-L6-v2"
+MODELO_LLM = "gpt-3.5-turbo"                        # Placeholder: reemplazar si se usa otro proveedor
+TAMANIO_CHUNK = 1000
+SOLAPE_CHUNK = 100
+K_VECINOS = 4                                         # número de documentos a recuperar
+
+# Variables de entorno requeridas para integraciones externas
+os.environ["OPENAI_BASE_URL"] = "https://models.inference.ai.azure.com"
+os.environ["OPENAI_EMBEDDINGS_URL"] = "https://models.github.ai/inference"
+os.environ["GITHUB_TOKEN"] = "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"
+os.environ["LANGSMITH_TRACING"] = "true"
+os.environ["LANGSMITH_API_KEY"] = "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"
+os.environ["LANGSMITH_PROJECT"] = "duoc_proyecto"
+
+# Palabras claves que consideramos sensibles (ejemplo)
+PALABRAS_SENSIBLES = ["clave", "password", "número de tarjeta", "cvv", "rut", "domicilio"]
+
+# Logging y trazabilidad
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+logger = logging.getLogger("BancoAndinoRAG")
+
+# ---------------- MODELOS DE DATOS API ----------------
+class SolicitudConsulta(BaseModel):
+    cliente_id: Optional[str]
+    canal: Optional[str] = "web"
+    pregunta: str
+
+
+class DocumentoFuente(BaseModel):
+    contenido_parcial: str
+    puntuacion: float
+    metadatos: Dict[str, Any]
+
+
+class RespuestaConsulta(BaseModel):
+    request_id: str
+    respuesta: str
+    documentos_fuente: List[DocumentoFuente]
+
+# ---------------- UTILIDADES DE SEGURIDAD ----------------
+
+def contiene_informacion_sensible(texto: str) -> bool:
+    t = texto.lower()
+    for k in PALABRAS_SENSIBLES:
+        if k in t:
+            return True
+    return False
+
+
+def sanitizar_respuesta(texto: str) -> str:
+    if contiene_informacion_sensible(texto):
+        return "Lo siento, no puedo procesar información que contenga datos personales sensibles. La consulta será derivada a un ejecutivo."
+    return texto
+
+# ---------------- GESTIÓN DE DOCUMENTOS E ÍNDICE ----------------
+
+def cargar_documentos_locales(carpeta: str):
+    documentos = []
+    for raiz, _, archivos in os.walk(carpeta):
+        for nombre in archivos:
+            if nombre.lower().endswith((".txt", ".md")):
+                ruta = os.path.join(raiz, nombre)
+                loader = TextLoader(ruta, encoding="utf8")
+                cargado = loader.load()
+                for doc in cargado:
+                    doc.metadata = {**doc.metadata, "archivo_origen": nombre}
+                    documentos.append(doc)
+    return documentos
+
+
+def construir_y_guardar_vectorstore(carpeta_documentos: str, ruta_guardado: str) -> FAISS:
+    logger.info("Iniciando indexado de documentos desde: %s", carpeta_documentos)
+    documentos = cargar_documentos_locales(carpeta_documentos)
+    if not documentos:
+        raise RuntimeError(f"No se encontraron documentos en: {carpeta_documentos}")
+
+    splitter = RecursiveCharacterTextSplitter(chunk_size=TAMANIO_CHUNK, chunk_overlap=SOLAPE_CHUNK)
+    trozos = splitter.split_documents(documentos)
+
+    embeddings = HuggingFaceEmbeddings(model_name=MODELO_EMBEDDING)
+    vectorstore_local = FAISS.from_documents(trozos, embeddings)
+
+    os.makedirs(os.path.dirname(ruta_guardado), exist_ok=True)
+    vectorstore_local.save_local(ruta_guardado)
+    logger.info("Índice guardado en: %s", ruta_guardado)
+    return vectorstore_local
+
+
+def cargar_vectorstore_guardado(ruta_guardado: str) -> FAISS:
+    embeddings = HuggingFaceEmbeddings(model_name=MODELO_EMBEDDING)
+    vs = FAISS.load_local(ruta_guardado, embeddings)
+    return vs
+
+# ---------------- PLANTILLAS DE PROMPTS ----------------
+PROMPT_BASE = (
+    "Eres un asistente virtual del Banco Andino. Responde únicamente con base en la normativa financiera chilena (CMF) "
+    "y en los documentos internos proporcionados. Si no encuentras la respuesta en las fuentes, indica al cliente que será derivado a un ejecutivo. "
+    "Responde de forma clara y breve."
+)
+
+PROMPT_CREDITO = (
+    "Un cliente pregunta: '{question}'. Usa exclusivamente las políticas internas de crédito y los plazos del Banco Andino presentes en la base de conocimiento. "
+    "No inventes datos. Si la información no está en las fuentes, deriva al cliente a un ejecutivo. Proporciona pasos si aplica."
+)
+
+PROMPT_APERTURA_CUENTA = (
+    "Un cliente consulta: '{question}'. Responde usando la guía oficial de apertura de productos del Banco Andino y la normativa CMF. "
+    "Enumera los requisitos en una lista corta. Si falta información, indica que la consulta será derivada."
+)
+
+
+def seleccionar_plantilla_prompt(pregunta: str) -> PromptTemplate:
+    q = pregunta.lower()
+    if any(k in q for k in ["crédito", "vencimiento", "cuota", "pago"]):
+        return PromptTemplate.from_template(PROMPT_CREDITO)
+    if any(k in q for k in ["abrir cuenta", "cuenta corriente", "requisitos para abrir", "abrir una cuenta"]):
+        return PromptTemplate.from_template(PROMPT_APERTURA_CUENTA)
+    return PromptTemplate.from_template(PROMPT_BASE)
+
+# ---------------- CONSTRUCCIÓN DEL CHAIN RAG ----------------
+
+def construir_chain_rag(vectorstore: FAISS) -> RetrievalQA:
+    retriever = vectorstore.as_retriever(search_type="similarity", search_kwargs={"k": K_VECINOS})
+    llm = OpenAI(model_name=MODELO_LLM, temperature=0.0)
+    chain = RetrievalQA.from_chain_type(llm=llm, chain_type="stuff", retriever=retriever, return_source_documents=True)
+    return chain
+
+# ---------------- API REST (FastAPI) ----------------
+app = FastAPI(title="Banco Andino - Agente RAG (Entrega EP1)")
+
+VECTORSTORE_GLOBAL: Optional[FAISS] = None
+CHAIN_RAG_GLOBAL: Optional[RetrievalQA] = None
+
+
+@app.on_event("startup")
+async def inicializar_sistema():
+    global VECTORSTORE_GLOBAL, CHAIN_RAG_GLOBAL
+    try:
+        if os.path.exists(RUTA_VECTORSTORE):
+            VECTORSTORE_GLOBAL = cargar_vectorstore_guardado(RUTA_VECTORSTORE)
+        else:
+            VECTORSTORE_GLOBAL = construir_y_guardar_vectorstore(CARPETA_DOCUMENTOS, RUTA_VECTORSTORE)
+
+        CHAIN_RAG_GLOBAL = construir_chain_rag(VECTORSTORE_GLOBAL)
+        logger.info("Sistema RAG inicializado y listo para recibir consultas.")
+    except Exception as error:
+        logger.exception("Error en inicialización: %s", error)
+
+
+@app.post("/consultar", response_model=RespuestaConsulta)
+async def atender_consulta(solicitud: SolicitudConsulta):
+    global CHAIN_RAG_GLOBAL, VECTORSTORE_GLOBAL
+    if CHAIN_RAG_GLOBAL is None or VECTORSTORE_GLOBAL is None:
+        raise HTTPException(status_code=503, detail="Servicio no disponible - inicialización en curso")
+
+    request_id = str(uuid.uuid4())
+    if contiene_informacion_sensible(solicitud.pregunta):
+        respuesta_texto = "La consulta contiene información sensible y será derivada a un ejecutivo."
+        return RespuestaConsulta(request_id=request_id, respuesta=respuesta_texto, documentos_fuente=[])
+
+    plantilla = seleccionar_plantilla_prompt(solicitud.pregunta)
+    prompt_final = plantilla.format(question=solicitud.pregunta)
+
+    try:
+        resultado = CHAIN_RAG_GLOBAL({"query": solicitud.pregunta})
+        texto_generado = resultado.get("result") if isinstance(resultado, dict) else str(resultado)
+        documentos_fuente_raw = resultado.get("source_documents", []) if isinstance(resultado, dict) else []
+
+        texto_generado = sanitizar_respuesta(texto_generado)
+
+        documentos_fuente: List[DocumentoFuente] = []
+        for doc in documentos_fuente_raw:
+            contenido_parcial = doc.page_content[:500] if hasattr(doc, "page_content") else str(doc)[:500]
+            puntuacion = float(doc.metadata.get("score", 0.0)) if isinstance(doc.metadata, dict) and "score" in doc.metadata else 0.0
+            documentos_fuente.append(DocumentoFuente(contenido_parcial=contenido_parcial, puntuacion=puntuacion, metadatos=doc.metadata))
+
+        traza = {
+            "request_id": request_id,
+            "cliente_id": solicitud.cliente_id,
+            "canal": solicitud.canal,
+            "pregunta": solicitud.pregunta,
+            "prompt_usado": plantilla.template,
+            "respuesta_resumen": texto_generado[:300]
+        }
+        with open("traces.log", "a", encoding="utf8") as f:
+            f.write(json.dumps(traza, ensure_ascii=False) + "\n")
+
+        return RespuestaConsulta(request_id=request_id, respuesta=texto_generado, documentos_fuente=documentos_fuente)
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail="Error interno al procesar la consulta")
+
+
+@app.get("/salud")
+async def estado_salud():
+    listo = VECTORSTORE_GLOBAL is not None and CHAIN_RAG_GLOBAL is not None
+    return {"status": "ok" if listo else "inicializando"}
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("Banco_Andino_RAG_Agent:app", host="0.0.0.0", port=8000, reload=True)
